@@ -1,0 +1,368 @@
+---
+title: Adverse Event Data Visualization for ClinicalTrials.Gov Data
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+geometry: margin=2cm
+fontsize: 11pt
+mainfont: Calibri Light
+graphics: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+<style type="text/css">
+  body{
+    font-family: Arial, Helvetica, sans-serif;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+# renv::dependencies()
+# renv::init()
+
+# tidyverse and data manipulation
+library("knitr")
+library("kableExtra")
+library("readxl")
+library("stringr")
+library("tidyverse")
+library("dplyr")
+library("writexl")
+library("openxlsx")
+library(jsonlite)
+
+# table package
+library("tibble")
+library("tidyr")
+library("gtsummary")
+
+# plot packages
+library(fmsb)
+library(ggradar)
+library(ggpubr)
+library(ctrdata)
+```
+
+
+# Downloading Data
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+
+# URL of Trial: https://www.clinicaltrials.gov/study/NCT03515837
+
+url_ctgov <- "https://www.clinicaltrials.gov/study/NCT03515837"
+q <- ctrGetQueryUrl(url = url_ctgov)
+
+dbc <- nodbi::src_sqlite(dbname = "my_db", collection = "my_coll")
+
+ctrLoadQueryIntoDb(queryterm = q, con = dbc)
+
+ae_fields <- c("resultsSection.adverseEventsModule.eventGroups.title",
+               "resultsSection.adverseEventsModule.eventGroups.id",
+               "resultsSection.adverseEventsModule.otherEvents.organSystem",
+               "resultsSection.adverseEventsModule.otherEvents.term",
+               "resultsSection.adverseEventsModule.otherEvents.stats",
+               "resultsSection.adverseEventsModule.seriousEvents.organSystem",
+               "resultsSection.adverseEventsModule.seriousEvents.term",
+               "resultsSection.adverseEventsModule.seriousEvents.stats")
+
+# In case you want other fields
+# dbFindFields(namepart = "adverse", sample = FALSE, con = dbc)
+
+result <- dbGetFieldsIntoDf(
+  fields = ae_fields,
+  con = dbc)
+
+# making arm and arm description dataset (to append later)
+arm <- trimws(unlist(strsplit(result$resultsSection.adverseEventsModule.eventGroups.id, "/")))
+arm_desc <- trimws(unlist(strsplit(result$resultsSection.adverseEventsModule.eventGroups.title, "/")))
+arm_df <- data.frame(arm, arm_desc)
+
+# -- unnesting/unlisting the data -- #
+ae_clean <- list()
+for (type in c("other", "serious")){
+
+  # subset to other or serious
+  df_subset <- result %>% 
+      select(contains(type))
+  
+  # remove long names
+  names(df_subset) <- sub(".*\\.", "", names(df_subset))
+  
+  # Seperate the variables that are listed as one long string
+  organSystem <- df_subset$organSystem
+  term <- df_subset$term
+
+  # Unnest Stats
+  df_unnest <- df_subset %>% 
+    unnest(stats) %>%
+    rename(arm = groupId, organSystemName = organSystem)
+  
+  organSystem_clean <- rep(trimws(unlist(strsplit(organSystem, "/"))), each = length(unique(df_unnest$arm)))
+  term_clean <- rep(trimws(unlist(strsplit(term, "/"))), each = length(unique(df_unnest$arm)))
+
+  ae_clean[[type]] <- df_unnest %>% 
+    mutate(organSystemName = organSystem_clean,
+           term = term_clean,
+           event_type = type)
+}
+
+ae_ctgov_df <- bind_rows(ae_clean) %>%
+  # adding arm description for labeling
+  left_join(arm_df, by = "arm")
+```
+
+## Radar plot
+
+### Prepping the Data
+This is an example of what the data looks like that was downloaded from clinicaltrials.gov:
+```{r}
+ae_ctgov_df %>%
+  kable()  %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    scroll_box(width = "950px", height = "410px")
+```
+
+Since we don't have patient level data to find out how many individuals were in each category, we will use the highest count per category's term as a way to display "at least this many people had an AE in this category":
+
+```{r}
+max_term_per_cat <- ae_ctgov_df %>%
+  group_by(event_type, organSystemName, arm) %>% 
+  arrange(desc(numAffected), .by_group=TRUE) %>%
+  filter(row_number()==1) %>%
+  ungroup()
+```
+
+Now we are ready to begin building the dataset. Let's start by renaming the categories to something shorter, but still informative:
+```{r}
+# Using manual renaming from excel sheet
+renaming_dat <- read_xlsx("Standardized Renaming//MEDRA_Word_Conversions.xlsx")
+
+filtered_data <- max_term_per_cat %>%
+  left_join(renaming_dat, by = "organSystemName") %>%
+  select(-organSystemName) %>%
+  rename(organSystemName = 'New Name') %>%
+  relocate(organSystemName, .after=term) %>%
+  arrange(desc(numAffected)) %>%
+  
+  # make pct var
+  mutate(pct_affected = numAffected/numAtRisk) %>%   
+  
+  # this arm is experimental so removing for visualization purposes
+  filter(!arm == "EG002")
+```
+
+Then we want to write a loop that takes in the data per event type, takes the ten most prelevant categories, makes each category a column with its own count, and creates a row per arm.
+```{r}
+event_data <- list()
+spider_plot_dat_list <- list()
+
+for (event in sort(unique(filtered_data$event_type))) {
+
+# Filtering grade and events
+filtered_event_dat <- filtered_data %>%
+  filter(event_type == event) %>% 
+  arrange(desc(numAffected))
+
+# Taking the 10 most prevalent overall categories
+categories <- filtered_event_dat %>% 
+  group_by(organSystemName) %>% 
+  mutate(total = sum(numAffected))  %>%
+  arrange(desc(total))  %>%
+  filter(row_number()==1)  %>%
+  ungroup() %>%
+  filter(row_number()==1:10) %>%
+  pull(organSystemName) 
+
+filtered_event_dat <- filtered_event_dat %>% 
+  filter(organSystemName %in% categories)
+
+
+# Pivoting to Wider for easiest formatting
+event_data[[event]] <- filtered_event_dat %>% 
+  select(organSystemName, arm_desc, pct_affected) %>% 
+  pivot_wider(id_cols = organSystemName,
+              names_from = arm_desc,
+              # names_prefix = "Grade ",
+              values_from = pct_affected,
+              values_fill = 0) %>% 
+  complete(organSystemName =categories) %>%
+  arrange(desc(`Placebo + Pemetrexed + Chemo`), desc(`Pembro + Pemetrexed + Chemo`)) %>% 
+  mutate(across(everything(), ~ replace_na(., 0)))
+
+# Making the spider plot data
+spider_plot_dat <- event_data[[event]]   %>%
+  rename(Category = organSystemName) 
+
+spider_dat <- as.data.frame(t(spider_plot_dat))
+names(spider_dat) <- lapply(spider_dat[1, ], as.character)
+spider_dat <- spider_dat[-1,] %>%
+  add_column(Name = rownames(spider_dat[-1,]), .before=1) %>%
+   mutate(across(-Name, ~ as.numeric(.)))
+rownames(spider_dat) <- NULL
+# colnames(spider_dat) <- sapply(colnames(spider_dat), function(x) strsplit(x, " ")[[1]][1])
+
+spider_plot_dat_list[[paste(event)]] <- spider_dat %>% 
+  mutate(Name = factor(Name,
+                           levels = c("Placebo + Pemetrexed + Chemo",
+                                      "Pembro + Pemetrexed + Chemo",
+                                      "Pembro Monotherapy following PD on Placebo + Pemetrexed + Chemo")))
+
+}
+```
+
+
+Here's what the loop produces for "Other Events" for example:
+```{r}
+spider_plot_dat_list$`other` %>% 
+ kable()  %>%
+ kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    scroll_box(width = "950px", height = "150px")
+```
+
+Now, we are ready to create the plots!
+
+### Creating Plot
+
+For creating a plot where each grade is an entirely separate plot, we would loop through each grade as so:
+
+```{r}
+color <- c("#619CFF", "#00BA38")
+title <- names(spider_plot_dat_list)
+spider_plots <- list()
+
+# Create the radar chart
+for(i in names(spider_plot_dat_list)){
+
+color_fix <- color
+if (nrow(spider_plot_dat_list[[i]]) < length(color)) {
+  color_fix <- color[(length(color) - nrow(spider_plot_dat_list[[i]]) + 1):length(color)]}
+
+spider_plots[[i]] <- ggradar(spider_plot_dat_list[[i]],
+        background.circle.colour = "white",
+        legend.position = "bottom",
+        font.radar = "serif",
+        grid.min = 0,
+        grid.mid = 0.5,
+        grid.max = 1,
+        axis.label.size = 3.5,
+        grid.label.size = 4,
+        legend.text.size = 10,
+        grid.line.width = 0.5,
+        group.colours = color_fix,
+        group.point.size = 2.3,
+        group.line.width = 1.2,
+        # axis.label.offset = 1.2,
+        gridline.label.offset = -0.005,
+        centre.y = -0.2)  +
+        # ggtitle(paste(i, "AEs"))  +
+        theme(plot.title = element_text(size = 12,
+                                        hjust = 0.5,
+                                        face = "bold")) +
+  theme(plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "lines")) + 
+guides(color = guide_legend(nrow = 3))
+}
+```
+
+
+Here is the "other" plot for example:
+```{r results = 'asis', fig.width=11, fig.height=9}
+spider_plots$other
+```
+
+Using ggarrange to put them all together
+```{r results = 'asis', fig.width=11, fig.height=9}
+radar_together <- ggarrange(plotlist = spider_plots, widths = c(1.7, 1.6), common.legend = TRUE,
+          legend = "bottom")
+
+radar_together
+```
+
+## Love Plots
+
+If the number of patients for each arm are not comparable (as in one has a much higher count than another), then a love plot is a good option for displaying the data
+
+
+The data does not really need to be altered too much, we just want to add a few variables that calculate percent of patients affect by each adverse event out of their arm
+```{r echo=TRUE}
+love_plot_dat <- ae_ctgov_df   %>%   
+  filter(!arm == "EG002") %>%
+  group_by(term, event_type) %>%
+  # creating a percent variable to calculate num effect by term/event type (ignoring arm)
+  mutate(total_pct_events = (sum(numAffected)/sum(numAtRisk))) %>%
+  arrange(total_pct_events) %>%
+  ungroup() %>%
+  mutate(pct_affeced_by_arm = numAffected/numAtRisk)
+```
+
+### Creating Plot
+
+We are going to make one plot for "other events" and one for "serious"
+```{r}
+# for other events
+other_chart <- love_plot_dat %>%
+  filter(event_type == "other") %>%
+  mutate(term = forcats::fct_inorder(term)) %>%
+  # picking events that happened over 5% of the time
+ggplot(data = .,
+       aes(x = pct_affeced_by_arm*100,
+           y = term,
+           group = arm_desc,
+           color = arm_desc)) +
+geom_point(size = 2) + 
+xlab("Percent of Patients Affected") +
+geom_line(orientation = "y", linewidth = 0.9)  + 
+  theme_bw() +
+   ggtitle("Other AEs") +
+  scale_color_manual(values=c("#619CFF", "#00BA38")) +
+  guides(colour=guide_legend(title="Treatment Arm"))
+
+serious_chart <- love_plot_dat %>%
+  filter(event_type == "serious") %>%
+  mutate(term = forcats::fct_inorder(term)) %>%
+  # picking events that happened over 5% of the time
+  filter(total_pct_events > 0.0025) %>%
+ggplot(data = .,
+       aes(x = pct_affeced_by_arm,
+           y = term,
+           group = arm,
+           color = arm,
+           fill = arm)) +
+geom_point(size = 2)  + 
+xlab("Percent of Patients Affected") + 
+ scale_color_manual(values=c("#619CFF", "#00BA38")) +
+  geom_line(orientation = "y", linewidth = 0.9)  + 
+  theme_bw() +
+  ggtitle("Serious AES")
+```
+
+```{r results = 'asis', fig.width=10, fig.height=6,fig.fullwidth=TRUE }
+ggarrange(other_chart, serious_chart,
+          legend = "bottom", common.legend=TRUE,
+          ncol = 2)
+```
+
+# Arranging together
+
+```{r results = 'asis', fig.width=10, fig.height=6,fig.fullwidth=TRUE }
+final_plot <- ggarrange(other_chart + ggtitle(""), 
+                        spider_plots$other + ggtitle(""),
+                        common.legend = TRUE, legend = "bottom",
+          widths = c(1, 1.5))
+
+final_plot
+```
+
+
+<!-- Code for turning it into a png: -->
+<!-- ```{r eval = false, echo=TRUE, include=FALSE} -->
+<!-- png(filename = "filepath", -->
+<!--     width = 12, height = 7, units = "in", res = 500) -->
+
+<!-- annotate_figure(final_plot,  -->
+<!--                 top = text_grob("Phase III trial of Pembrolizumab + Chemotherapy in nonsquamous NSCLC (KEYNOTE-789): Adverse Events",  -->
+<!--                face = "bold", size = 14)) -->
+<!-- dev.off() -->
+<!-- ``` -->
