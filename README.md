@@ -11,7 +11,11 @@ There are two components to the code files found in this repository.
 2. Creating adverse event visualizations
 
 ### ClinicalTrials.Gov Reporting
+An important part of the clinical trial workflow is reporting analysis results and adverse events to clinicaltrials.gov. For the reporting of adverse events, clinicaltrials.gov generates a unique template for each trial that needs to be filled and submitted to the site, where the column headers change depending on treatment – format is: Treatment (trt{numSubjectAffected}
 
+![Example Template](figures/template_example.png)
+
+This is typically done manually, with many potentials for error throughout the process. We created functions to transform the standardized data export for clinical trials into the clinicaltrials.gov template structure and directly paste the data onto the template. These functions allow for a streamlined and expedited approach for reporting AEs to clinicaltrials.gov. 
 
 
 ### AE Visualization
