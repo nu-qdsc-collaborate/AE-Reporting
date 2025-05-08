@@ -1,0 +1,433 @@
+---
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+geometry: margin=2cm
+fontsize: 11pt
+mainfont: Calibri Light
+graphics: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+<style type="text/css">
+  body{
+    font-family: Arial, Helvetica, sans-serif;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+# tidyverse and data manipulation
+library("knitr")
+library("kableExtra")
+library("readxl")
+library("stringr")
+library("tidyverse")
+library("dplyr")
+library("writexl")
+library("openxlsx")
+
+# table package
+library("tibble")
+library("tidyr")
+library("gtsummary")
+
+# plot packages
+library(fmsb)
+library(ggradar)
+library(ggpubr)
+
+# knitr options
+opts_chunk$set(echo = TRUE, include = TRUE,
+               warning = FALSE, message = FALSE,
+               comment = "  ", prompt = TRUE)
+
+# format numbers
+opts_knit$set(root.dir = "./") # Change working directory here
+knit_hooks$set(
+  inline = function(x){
+    if(!is.numeric(x)){x} 
+    else{prettyNum(x, big.mark = ",")}
+  }
+)
+
+# formatting options
+options(round = 4,
+        digits = 3,
+        stringsAsFactors = FALSE)
+```
+
+# Data Step
+
+```{r echo=FALSE}
+source("G:\\KocherginskyM_984\\Analysis\\Code\\ctgov_function_code_script_02_19_24.R")
+```
+
+## Prepping your data for spider plots
+```{r echo=FALSE}
+dir_ <- "G://01 NUProtocols//NU18H02//"
+dat_dir_ <- paste0(dir_, "Analysis//Data//Update 02.2022//")
+
+dat_resp <- read.csv(paste0(dat_dir_, "NU 18H02-Data-Responses-02_24_2022 09_58.csv"))
+dat_demo <- read.csv(paste0(dat_dir_, "NU 18H02-Arms_12_18_2023.csv"))
+dat_eval <- read_xlsx(paste0(dat_dir_, "NU18H02_evaluability_12_18_2023.xlsx"))
+
+#Dataset with renamed categories
+renaming_dat <- read_xlsx("CTCAE_Word_Conversions.xlsx")
+
+all_ae_dat <- dat_resp %>%
+  filter(form_title == "Adverse Events TAK-659 & R-CHOP CRF") %>%
+    select(ptid, response_set_id,	Timepoint, Status, starts_with("ae")) %>%
+    mutate(ae_st_date = mdy(ae_st_date))
+
+dt_consent_data <- dat_resp %>%
+  filter(form_title == "Consent Form v1") %>%
+  select(ptid, dt_consent) %>%
+  mutate(dt_consent = mdy(dt_consent)) %>%
+  group_by(ptid) %>%
+  arrange(dt_consent) %>%
+  filter(row_number() == 1)
+
+dat_ae_merged <- merge(all_ae_dat, dt_consent_data, by = "ptid")
+dat_ae_merged <- merge(dat_ae_merged, dat_demo %>%
+                         select(ptid, d_arm), by = "ptid")
+
+tox_eval_ptid <- dat_eval$`CASE NUM`[dat_eval$`Evaluable for toxicity` == "yes"]
+# # Before Processing:
+# dim(dat_ae_merged)
+# length(unique(dat_ae_merged$ptid))
+
+# Processing
+processed_ae_data <- pre_processing_ae_data(dat_ae_merged)
+# dim(processed_ae_data)
+# length(unique(processed_ae_data$ptid))
+
+
+# getting max ae per term per person (related)
+maxae_data_multiarm <- processed_ae_data %>%
+    filter(ae_rel_int1 %in% c("Possible","Probable" ,"Definite", 0 , 1, 2)) %>%
+    # grouping by category + term
+    group_by(ptid, organSystemName, term, d_arm) %>%
+    # summarise by max grade
+    dplyr::summarise(max_aegrade = max(ae_grade)) %>%
+    ungroup()
+
+
+# processed_ae_data %>%
+#   select(ptid, d_arm) %>%
+#   write_csv(path = "G:\\KocherginskyM_984\\Analysis\\Data\\id_dat.csv")
+# 
+# processed_ae_data %>%
+#   select(ptid, term, organSystemName, ae_grade, ae_rel_int1) %>%
+#   write_csv(path = "G:\\KocherginskyM_984\\Analysis\\Data\\ae_dat.csv")
+```
+
+```{r}
+maxae_data_multiarm2 <- maxae_data_multiarm %>%
+  left_join(renaming_dat, by = "organSystemName") %>%
+  select(-organSystemName) %>%
+  rename(organSystemName = 'New Name')  # %>%
+  # mutate(max_aegrade = if_else(max_aegrade %in% c(1,2),
+  #                              "1/2",
+  #                              as.character(max_aegrade)))
+
+# making the presentation categories
+regroup <- maxae_data_multiarm2 %>%
+  mutate(organSystemName = case_when(
+    term %in% c("Lymphocyte count decreased", "Lymphocyte count increased",
+                     "Anemia", "Platelet count decreased", "Neutrophil count decreased",
+                     "Febrile neutropenia") ~  "Hematologic", 
+    term %in% c("Aspartate aminotransferase increased", 
+  "Alanine aminotransferase increased", 
+  "Alkaline phosphatase increased",
+  "Blood lactate dehydrogenase increased", 
+  "Blood bilirubin increased", "Serum amylase increased", 
+  "Lipase increased", "GGT increased", "Hypocalcemia", "Electrocardiogram QT corrected interval prolonged",
+  "Sepsis", "Thrush", "Infections and infestations - Other, specify", "Urinary tract infection", 
+  "Skin infection", "Upper respiratory infection", "Lung infection", "Fever", "Facial pain" , "Fatigue",
+  "Weight loss", "Anorexia", "Myalgia", "Hypertension", "Diarrhea", "Nausea", "Vomiting") ~ "Non-\nHematologic",
+  TRUE ~ NA)) %>%
+  filter(!is.na(organSystemName))
+
+new_ae <- rbind(maxae_data_multiarm2, regroup)
+```
+
+```{r}
+# Taking the 10 most prevalent overall categories
+categories <- new_ae %>% 
+  group_by(ptid, organSystemName) %>% 
+  filter(row_number()==1) %>%
+  group_by(organSystemName) %>% 
+  summarise(N = n()) %>% 
+  arrange(desc(N)) %>%
+  dplyr::filter(row_number()==1:10) %>%
+  pull(organSystemName)
+
+filtered_data <- new_ae %>% 
+  filter(organSystemName %in% categories)
+```
+
+```{r}
+total_counts <- c(
+  "Dose Level 1 (60mg)" = 3,
+  "Dose Level 2 (80mg)" = 3,
+  "Dose Level 3 (100mg)" = 6
+)
+
+col_order <- NULL
+grade_data <- list()
+spider_plot_dat_list <- list()
+
+for (grade in sort(unique(filtered_data$max_aegrade))) {
+
+# Filtering grade and events
+filtered_grade_dat <- filtered_data %>%
+  filter(max_aegrade == grade) %>% 
+  arrange(desc(max_aegrade))
+
+grade_data[[grade]] <- filtered_grade_dat %>% 
+  group_by(ptid, organSystemName) %>% 
+  filter(row_number()==1) %>%
+  group_by(organSystemName, d_arm) %>%
+  mutate(N = n()) %>%
+  select(organSystemName, d_arm, max_aegrade, N) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  pivot_wider(id_cols = organSystemName,
+              names_from = d_arm,
+              # names_prefix = "Grade ",
+              values_from = N,
+              values_fill = 0) %>% 
+  complete(organSystemName =categories) %>%
+  # arrange(desc(`Dose Level 3 (100mg)`)) %>%
+  mutate(across(everything(), ~ replace_na(., 0))) 
+
+# Divide each arm's count by the total per arm to get proportions
+grade_data[[grade]] <- grade_data[[grade]] %>%
+    mutate(across(-organSystemName, ~ . / total_counts[cur_column()]))
+
+  
+# Making the spider plot data
+spider_plot_dat <- grade_data[[grade]]  %>%
+  rename(Category = organSystemName) 
+
+spider_dat <- as.data.frame(t(spider_plot_dat))
+names(spider_dat) <- lapply(spider_dat[1, ], as.character)
+spider_dat <- spider_dat[-1,] %>%
+  add_column(Name = rownames(spider_dat[-1,]), .before=1) %>%
+   mutate(across(-Name, ~ as.numeric(.)))
+rownames(spider_dat) <- NULL
+# colnames(spider_dat) <- sapply(colnames(spider_dat), function(x) strsplit(x, " ")[[1]][1])
+
+# spider_dat2 <- spider_dat[, c(1, order(-colSums(spider_dat[, -1]), -as.numeric(spider_dat[3, -1])) + 1)]
+
+ # Set the column order only once
+  if (is.null(col_order)) {
+    col_order <- c(1, order(-colSums(spider_dat[, -1])) + 1)
+  }
+
+# Apply the stored column order
+  spider_dat2 <- spider_dat[, col_order]
+
+  spider_plot_dat_list[[paste("Grade ", grade)]] <- spider_dat2
+}
+```
+
+## Plot A - All Seperate Arms 
+
+For creating a plot where each grade is an entirely separate plot, we would loop through each grade as so:
+
+```{r}
+color <- c("#F0E442", "#E69F00", "firebrick3")
+title <- names(spider_plot_dat_list)
+spider_plots <- list()
+
+# Create the radar chart
+for(i in names(spider_plot_dat_list)){
+
+color_fix <- color
+if (nrow(spider_plot_dat_list[[i]]) < length(color)) {
+  color_fix <- color[(length(color) - nrow(spider_plot_dat_list[[i]]) + 1):length(color)]}
+
+spider_plots[[i]] <- ggradar(spider_plot_dat_list[[i]],
+        background.circle.colour = "white",
+        legend.position = "bottom",
+        font.radar = "serif",
+        grid.min = 0,
+        grid.mid = 0.5,
+        grid.max = 1,
+        axis.label.size = 12,
+        grid.label.size = 12,
+        legend.text.size = 12,
+        grid.line.width = 1.5,
+        group.colours = color_fix,
+        group.point.size = 6.5,
+        group.line.width = 4.5,
+        # axis.label.offset = 1.2,
+        gridline.label.offset = 0.2,
+        centre.y = -0.25,
+        point.alpha = 0.9,
+        line.alpha = 0.8)  +
+        ggtitle(paste(i))  + 
+        theme(plot.title = element_text(size = 35,
+                                        hjust = 0.5,
+                                        face = "bold")) +
+   theme(plot.margin = margin(0,0,0,0, 'cm'))
+}
+```
+
+
+Using ggarrange to put them all together (plot_grid also works)
+```{r}
+allgrades_plot <- ggarrange(plotlist = spider_plots, widths = c(0.5,0.5), common.legend = TRUE,
+          legend = "bottom")
+
+plot_grid(
+  ggarrange(plotlist = list(spider_plots[[1]], ggplot() + theme_void(), spider_plots[[2]]), 
+            ncol=3, legend = "none",
+            widths = c(1,0.01,1)),
+  ggarrange(plotlist = list(spider_plots[[3]], NULL, spider_plots[[4]]), ncol=3, legend = "none"),
+  ncol=2
+  )
+
+allgrades_plot <- ggarrange(plotlist = list(spider_plots[[1]], 
+                                           ggplot() + theme_void(), 
+                                           spider_plots[[2]],
+                                           spider_plots[[3]], 
+                                           ggplot() + theme_void(), 
+                                           spider_plots[[4]]), 
+                            widths = c(1, 0.001, 1, 1, 0.001, 1), 
+                            common.legend = TRUE, legend = "bottom")
+
+
+allgrades_plot
+```
+
+
+# Waterfall Plots
+
+## Prepping the Data
+
+The data does not really need to be altered too much, we just want to add a few variables that calculate percent of patients affect by each adverse event out of their arm
+```{r echo=TRUE}
+love_plot_dat <- maxae_data_multiarm2 %>%
+  mutate(term = gsub(" - Other, specify", "", term),
+         max_aegrade = paste("Grade", max_aegrade)) %>%
+    # max_aegrade = case_when(
+    #   max_aegrade %in% c(3, 4) ~ "3/4",
+    #   TRUE ~ max_aegrade)) %>%
+  group_by(organSystemName, term, d_arm, max_aegrade) %>%
+  summarise(n_pt = length(unique(ptid)), .groups = "drop") %>% 
+  # Complete missing combinations with 0
+  mutate(arm_sum = case_when(
+    d_arm == "Dose Level 1 (60mg)" ~ 3,
+    d_arm == "Dose Level 2 (80mg)" ~ 3,
+    d_arm == "Dose Level 3 (100mg)" ~ 6),
+  pct_affeced_by_arm =  n_pt/arm_sum)  %>%   
+  group_by(d_arm, term) %>%
+  # creating a percent variable to calculate num effect by term/event type (ignoring arm)
+  mutate(total_pct_events = sum(pct_affeced_by_arm)) %>%
+  ungroup() %>% arrange(total_pct_events)
+```
+
+### Creating Plot
+
+We are going to make one plot per arm
+```{r}
+
+love_plots <- list()
+for (i in sort(unique(love_plot_dat$d_arm))){
+  
+love_plots[[i]] <- love_plot_dat %>%
+  filter(d_arm == i) %>%
+  group_by(term) %>% 
+  mutate(pct_total = sum(n_pt)) %>%
+  arrange(pct_total) %>%
+  ungroup() %>%
+  mutate(term = forcats::fct_inorder(term)) %>%
+   # picking events that happened over 5% of the time
+  filter(total_pct_events > 0.4) %>%
+  complete(nesting(organSystemName, term), d_arm, max_aegrade, fill = list(pct_affeced_by_arm = 0)) %>%
+ggplot(data = .,
+       aes(x = pct_affeced_by_arm*100,
+           y = term,
+           group = max_aegrade,
+           color = max_aegrade)) +
+geom_point(size = 2) + 
+expand_limits(x=c(0,100)) +
+scale_x_continuous(breaks = c(0, 20, 40, 60 , 80, 100)) +
+xlab("Percent of Patients Affected") +
+geom_line(orientation = "y", linewidth = 0.9)  + 
+  theme_bw() +
+  ggtitle(paste(i)) +
+  scale_color_manual(values=c("#7AD151FF", "#2A788EFF", "#440154FF")) +
+  # scale_colour_viridis_d(direction = -1) +
+  guides(colour=guide_legend(title="Grade")) +
+  theme(text = element_text(size = 15))
+}
+```
+
+
+```{r results = 'asis', fig.width=15, fig.height=10,fig.fullwidth=TRUE }
+date <-  gsub("/", "", format(as.Date(Sys.Date()), "%m/%d/%y"))
+
+
+love_plots_arrange <- ggarrange(plotlist=love_plots,
+          legend = "none",
+          ncol = 3)
+love_plots_arrange
+
+png(filename = file.path("G://KocherginskyM_984//Documentation//", paste0("love_plot_all_", date, ".png")),
+    width = 25, height = 20, units = "in", res = 500)
+print(love_plots_arrange)
+dev.off()
+
+png(filename = file.path("G://KocherginskyM_984//Documentation//", paste0("love_plot_dose3", date, ".png")),
+    width = 10, height = 11, units = "in", res = 500)
+print(love_plots[["Dose Level 3 (100mg)"]])
+dev.off()
+
+png(filename = "G://KocherginskyM_984//Documentation//love_plot_NU18H02_justone_042525.png",
+    width = 10, height = 11, units = "in", res = 500)
+print(love_plot_total)
+dev.off()
+
+png(filename = "G://KocherginskyM_984//Documentation//love_plot_NU18H02_grade3_042425.png",
+    width = 10, height = 11, units = "in", res = 500)
+print(love_plots[["3/4"]])
+dev.off()
+
+png(filename = "G://KocherginskyM_984//Documentation//love_plot_NU18H02_grade4_042425.png",
+    width = 10, height = 11, units = "in", res = 500)
+print(love_plots[["4"]])
+
+dev.off()
+
+
+
+png(filename = "G://KocherginskyM_984//Documentation//radar_plot_NU18H02_041625.png",
+    width = 12, height = 7, units = "in", res = 500)
+annotate_figure(allgrades_plot, top = text_grob("Treatment-related adverse events from the
+combination of TAK-659 and R-CHOP at each dose level", 
+               face = "bold", size = 14))
+dev.off()
+```
+
+
+```{r results = 'asis', fig.width=15, fig.height=10,fig.fullwidth=TRUE }
+for (i in names(spider_plots)){
+png(filename = file.path("G://KocherginskyM_984//Documentation//", paste0("radarplot_", gsub("/", "", i), "_", date, ".png")),
+    width = 16, height = 16, units = "in", res = 500)
+print(spider_plots[[i]])
+dev.off()
+}
+
+for (i in names(spider_plots_combined)){
+png(filename = file.path("G://KocherginskyM_984//Documentation//", paste0("radarplot_", gsub("/", "", i), "_", date, ".png")),
+    width = 16, height = 16, units = "in", res = 500)
+print(spider_plots_combined[[i]])
+dev.off()
+}
+```
